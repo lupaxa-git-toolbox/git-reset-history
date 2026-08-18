@@ -15,7 +15,7 @@
 #          Only use if you are absolutely sure.
 #
 
-VERSION="0.0.0"
+VERSION="0.1.0"
 
 REMOTE_NAME="origin"
 PRIMARY_BRANCH=""
