@@ -1,0 +1,21 @@
+# Private Superpowers specs/plans (symlink into Lupaxa cursor-docs vault)
+cursor-docs
+
+# Never push local Cursor project config
+.cursor/
+
+.worktrees/
+.makefiles/
+.superpowers/
+site/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store

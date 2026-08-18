@@ -1,0 +1,819 @@
+#!/usr/bin/env bash
+#
+# git-reset-history
+#
+# Completely rewrite Git history to a single initial commit.
+#
+# Default behaviour (no flags):
+#   - Detect primary branch (from <remote>/HEAD or current branch, fallback: master)
+#   - Replace the primary branch history with a single initial commit
+#   - Force-push the new history to origin/<branch>
+#   - Delete ALL tags locally and on the remote
+#   - Run aggressive git gc
+#
+# WARNING: This is destructive when not in dry-run.
+#          Only use if you are absolutely sure.
+#
+
+VERSION="0.0.0"
+
+REMOTE_NAME="origin"
+PRIMARY_BRANCH=""
+TARGET_BRANCH=""
+COMMIT_MESSAGE="The initial commit"
+
+DRY_RUN="false"
+ASSUME_YES="false"
+KEEP_TAGS="false"
+KEEP_BRANCH="false"
+
+NO_GC="false"
+NO_FETCH="false"
+LOCAL_ONLY="false"
+ALLOW_DIRTY="false"
+
+BACKUP_BRANCH=""
+FORCE_BACKUP="false"
+PUSH_BACKUP="false"
+
+PROTECTED_TAGS=()
+SUMMARY_ONLY="false"
+TAGS_DELETED_COUNT=0
+TAGS_OUTCOME="none"   # none|kept|deleted|failed
+
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_BOLD=""
+COLOR_RESET=""
+
+STEP_CURRENT=0
+STEP_TOTAL=0
+STEP_LABEL=""
+
+count_planned_steps()
+{
+    # Units: fetch?, backup?, rewrite, push?, tags?, gc?
+    STEP_TOTAL=1
+    if [ "${NO_FETCH}" = "false" ] && [ "${LOCAL_ONLY}" = "false" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ -n "${BACKUP_BRANCH}" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${KEEP_TAGS}" = "false" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${NO_GC}" = "false" ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+}
+
+begin_step()
+{
+    STEP_CURRENT=$((STEP_CURRENT + 1))
+    STEP_LABEL="[${STEP_CURRENT}/${STEP_TOTAL}]"
+}
+
+init_colors()
+{
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+    then
+        COLOR_RED=$'\033[31m'
+        COLOR_GREEN=$'\033[32m'
+        COLOR_YELLOW=$'\033[33m'
+        COLOR_CYAN=$'\033[36m'
+        COLOR_BOLD=$'\033[1m'
+        COLOR_RESET=$'\033[0m'
+    fi
+}
+
+usage()
+{
+    cat <<EOF
+${COLOR_BOLD}Usage:${COLOR_RESET} $0 [options]
+
+Rewrite a Git repository down to a single initial commit (destructive).
+
+Core options:
+  -m, --message TEXT       Commit message for the new initial commit
+                           (default: "${COMMIT_MESSAGE}")
+  -b, --branch NAME        Target branch for the new history.
+                           By default, the primary branch is auto-detected
+                           from <remote>/HEAD, falling back to the current branch.
+  -r, --remote NAME        Remote to operate on (default: "${REMOTE_NAME}")
+  -n, --dry-run            Show what would be done, but don't change anything
+                           (commands are simulated)
+  -S, --summary            Print a detailed action plan based on all flags and exit.
+                           No commands, no prompts, no changes.
+  -y, --yes                Assume 'RESET' confirmation (non-interactive / CI mode)
+
+History & tag behaviour:
+  -k, --keep-tags          Do NOT delete any tags (local or remote).
+  -T, --protect-tag TAG    Protect a specific tag from deletion even when tags
+                           are being deleted. Can be specified multiple times.
+  -K, --keep-branch        Keep the original primary branch and create a new
+                           branch with the rewritten history (default suffix: -reset)
+
+Backup & safety:
+  -B, --backup-branch NAME Create a backup branch from the original primary
+                           before rewriting.
+  -U, --force-backup       If the backup branch already exists, delete and recreate it.
+  -P, --push-backup        Push the backup branch to the remote as well.
+
+Environment & plumbing:
+  -F, --no-fetch           Do not run 'git fetch' before rewriting.
+  -G, --no-gc              Do not run 'git gc --aggressive --prune=all' at the end.
+  -L, --local-only         Do NOT touch any remote at all. All changes are local only.
+  -D, --allow-dirty        Allow running with a dirty working tree.
+  -V, --version            Print version and exit
+  -h, --help               Show this help and exit
+EOF
+}
+
+run()
+{
+    desc="$1"
+    shift
+
+    echo
+    if [ -n "${STEP_LABEL}" ]
+    then
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL} ${desc}${COLOR_RESET}"
+    else
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${desc}${COLOR_RESET}"
+    fi
+    echo "    $*"
+
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+        return 0
+    fi
+
+    if ! "$@"
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} ${desc} failed. Aborting." >&2
+        exit 1
+    fi
+}
+
+parse_args()
+{
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+            -m|--message)
+                if [ -z "${2:-}" ]
+                then
+                    echo "${COLOR_RED}ERROR:${COLOR_RESET} ${1} requires an argument." >&2
+                    exit 1
+                fi
+                COMMIT_MESSAGE="$2"
+                shift 2
+                ;;
+            -b|--branch)
+                if [ -z "${2:-}" ]
+                then
+                    echo "${COLOR_RED}ERROR:${COLOR_RESET} ${1} requires an argument." >&2
+                    exit 1
+                fi
+                TARGET_BRANCH="$2"
+                shift 2
+                ;;
+            -r|--remote)
+                if [ -z "${2:-}" ]
+                then
+                    echo "${COLOR_RED}ERROR:${COLOR_RESET} ${1} requires an argument." >&2
+                    exit 1
+                fi
+                REMOTE_NAME="$2"
+                shift 2
+                ;;
+            -n|--dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            -S|--summary)
+                SUMMARY_ONLY="true"
+                shift
+                ;;
+            -y|--yes)
+                ASSUME_YES="true"
+                shift
+                ;;
+            -k|--keep-tags)
+                KEEP_TAGS="true"
+                shift
+                ;;
+            -T|--protect-tag)
+                if [ -z "${2:-}" ]
+                then
+                    echo "${COLOR_RED}ERROR:${COLOR_RESET} ${1} requires an argument." >&2
+                    exit 1
+                fi
+                PROTECTED_TAGS+=( "$2" )
+                shift 2
+                ;;
+            -K|--keep-branch)
+                KEEP_BRANCH="true"
+                shift
+                ;;
+            -B|--backup-branch)
+                if [ -z "${2:-}" ]
+                then
+                    echo "${COLOR_RED}ERROR:${COLOR_RESET} ${1} requires an argument." >&2
+                    exit 1
+                fi
+                BACKUP_BRANCH="$2"
+                shift 2
+                ;;
+            -U|--force-backup)
+                FORCE_BACKUP="true"
+                shift
+                ;;
+            -P|--push-backup)
+                PUSH_BACKUP="true"
+                shift
+                ;;
+            -F|--no-fetch)
+                NO_FETCH="true"
+                shift
+                ;;
+            -G|--no-gc)
+                NO_GC="true"
+                shift
+                ;;
+            -L|--local-only)
+                LOCAL_ONLY="true"
+                shift
+                ;;
+            -D|--allow-dirty)
+                ALLOW_DIRTY="true"
+                shift
+                ;;
+            -V|--version)
+                echo "git-reset-history ${VERSION}"
+                exit 0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "${COLOR_RED}ERROR:${COLOR_RESET} Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+        esac
+    done
+}
+
+check_clean_worktree()
+{
+    if [ "${ALLOW_DIRTY}" = "true" ]
+    then
+        return
+    fi
+
+    if [ -n "$(git status --porcelain)" ]
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} Working tree is not clean." >&2
+        echo "       Commit or stash your changes, or use --allow-dirty if you" >&2
+        echo "       really know what you are doing." >&2
+        exit 1
+    fi
+}
+
+sanity_checks()
+{
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} This does not appear to be a Git repository." >&2
+        exit 1
+    fi
+
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        if ! git remote get-url "${REMOTE_NAME}" >/dev/null 2>&1
+        then
+            echo "${COLOR_RED}ERROR:${COLOR_RESET} Remote '${REMOTE_NAME}' does not exist." >&2
+            exit 1
+        fi
+    fi
+
+    check_clean_worktree
+}
+
+detect_primary_branch()
+{
+    if [ -n "${TARGET_BRANCH}" ] && [ "${KEEP_BRANCH}" = "false" ]
+    then
+        PRIMARY_BRANCH="${TARGET_BRANCH}"
+        return
+    fi
+
+    remote_head="$(
+        git symbolic-ref --quiet --short "refs/remotes/${REMOTE_NAME}/HEAD" 2>/dev/null || true
+    )"
+
+    if [ -n "${remote_head}" ]
+    then
+        base_branch="${remote_head#"${REMOTE_NAME}"/}"
+        if [ -n "${base_branch}" ]
+        then
+            PRIMARY_BRANCH="${base_branch}"
+        fi
+    fi
+
+    if [ -z "${PRIMARY_BRANCH}" ]
+    then
+        current_branch="$(
+            git symbolic-ref --quiet --short HEAD 2>/dev/null || true
+        )"
+        if [ -n "${current_branch}" ]
+        then
+            PRIMARY_BRANCH="${current_branch}"
+        fi
+    fi
+
+    if [ -z "${PRIMARY_BRANCH}" ]
+    then
+        PRIMARY_BRANCH="master"
+    fi
+
+    if [ -n "${TARGET_BRANCH}" ]
+    then
+        return
+    fi
+
+    if [ "${KEEP_BRANCH}" = "true" ]
+    then
+        TARGET_BRANCH="${PRIMARY_BRANCH}-reset"
+    else
+        TARGET_BRANCH="${PRIMARY_BRANCH}"
+    fi
+}
+
+branch_exists()
+{
+    git show-ref --verify --quiet "refs/heads/$1"
+}
+
+remote_branch_exists()
+{
+    git show-ref --verify --quiet "refs/remotes/${REMOTE_NAME}/$1"
+}
+
+resolve_backup_start_point()
+{
+    if branch_exists "${PRIMARY_BRANCH}"
+    then
+        echo "${PRIMARY_BRANCH}"
+        return
+    fi
+
+    if remote_branch_exists "${PRIMARY_BRANCH}"
+    then
+        echo "${REMOTE_NAME}/${PRIMARY_BRANCH}"
+        return
+    fi
+
+    echo "${COLOR_RED}ERROR:${COLOR_RESET} Cannot create backup: primary branch '${PRIMARY_BRANCH}'" >&2
+    echo "       not found as local refs/heads/${PRIMARY_BRANCH} or" >&2
+    echo "       refs/remotes/${REMOTE_NAME}/${PRIMARY_BRANCH}." >&2
+    return 1
+}
+
+validate_combinations()
+{
+    if [ "${KEEP_BRANCH}" = "true" ] && [ "${TARGET_BRANCH}" = "${PRIMARY_BRANCH}" ]
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} --keep-branch requested, but target branch '${TARGET_BRANCH}'" >&2
+        echo "       is the same as the primary branch '${PRIMARY_BRANCH}'." >&2
+        exit 1
+    fi
+
+    if [ "${LOCAL_ONLY}" = "true" ] && [ "${PUSH_BACKUP}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}WARNING:${COLOR_RESET} --local-only used with --push-backup; backup will not be pushed." >&2
+    fi
+}
+
+print_action_plan()
+{
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo "${COLOR_BOLD}=== ACTION SUMMARY (no commands will be executed) ===${COLOR_RESET}"
+    else
+        echo "${COLOR_BOLD}=== ACTION PLAN ===${COLOR_RESET}"
+    fi
+    echo
+
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        echo "Remote:             ${COLOR_CYAN}${REMOTE_NAME}${COLOR_RESET}"
+    else
+        echo "Remote:             ${COLOR_YELLOW}(local-only mode: no remote operations)${COLOR_RESET}"
+    fi
+
+    echo "Primary branch:     ${COLOR_GREEN}${PRIMARY_BRANCH}${COLOR_RESET}"
+    echo "Target branch:      ${COLOR_GREEN}${TARGET_BRANCH}${COLOR_RESET}"
+    echo "Keep primary:       ${KEEP_BRANCH}"
+    echo "Commit message:     \"${COMMIT_MESSAGE}\""
+    echo "Working tree clean: $(
+        [ "${ALLOW_DIRTY}" = "true" ] \
+            && echo "${COLOR_YELLOW}not required (ALLOW_DIRTY)${COLOR_RESET}" \
+            || echo "${COLOR_GREEN}required${COLOR_RESET}"
+    )"
+    echo
+
+    if [ -n "${BACKUP_BRANCH}" ]
+    then
+        echo "Backup branch:"
+        echo "  Name:             ${COLOR_GREEN}${BACKUP_BRANCH}${COLOR_RESET}"
+        echo "  Overwrite:        ${FORCE_BACKUP}"
+        echo "  Push to remote:   ${PUSH_BACKUP}"
+        echo
+    fi
+
+    echo "Tag behaviour:"
+    if [ "${KEEP_TAGS}" = "true" ]
+    then
+        echo "  Keep all tags:    ${COLOR_GREEN}yes${COLOR_RESET}"
+        echo "  Protected tags:   (irrelevant, tags are not deleted)"
+    else
+        echo "  Keep all tags:    ${COLOR_RED}no${COLOR_RESET}"
+        if [ "${#PROTECTED_TAGS[@]}" -gt 0 ]
+        then
+            echo "  Protected tags:   ${PROTECTED_TAGS[*]}"
+            echo "  Effect:           All non-protected tags will be deleted."
+        else
+            echo "  Protected tags:   none"
+            echo "  Effect:           All tags will be deleted."
+        fi
+        echo "  When:             After rewrite (and push, unless --local-only)."
+    fi
+    echo
+
+    echo "Other behaviour:"
+    echo "  Dry-run:          ${DRY_RUN}"
+    echo "  Summary-only:     ${SUMMARY_ONLY}"
+    echo "  Fetch before:     $(
+        [ "${NO_FETCH}" = "true" ] && echo "no (--no-fetch)" || echo "yes"
+    )"
+    echo "  Run git gc:       $(
+        [ "${NO_GC}" = "true" ] && echo "no (--no-gc)" || echo "yes"
+    )"
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}No commands have been executed because --summary was used.${COLOR_RESET}"
+    fi
+}
+
+confirm()
+{
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}${COLOR_YELLOW}DRY-RUN:${COLOR_RESET} No changes will be made. Commands will be simulated."
+        echo
+        return
+    fi
+
+    echo
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo " ${COLOR_RED}DANGER:${COLOR_RESET} This will IRREVERSIBLY rewrite Git history."
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo
+
+    if [ "${ASSUME_YES}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}--yes supplied, proceeding without interactive confirmation.${COLOR_RESET}"
+        return
+    fi
+
+    read -r -p "Type 'RESET' to continue, or anything else to abort: " answer
+
+    if [ "${answer}" != "RESET" ]
+    then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+create_backup_if_requested()
+{
+    if [ -z "${BACKUP_BRANCH}" ]
+    then
+        return
+    fi
+
+    if branch_exists "${BACKUP_BRANCH}"
+    then
+        if [ "${FORCE_BACKUP}" = "true" ]
+        then
+            run "Deleting existing backup branch '${BACKUP_BRANCH}' (force-backup)" \
+                git branch -D "${BACKUP_BRANCH}"
+        else
+            echo "${COLOR_RED}ERROR:${COLOR_RESET} Backup branch '${BACKUP_BRANCH}' already exists." >&2
+            exit 1
+        fi
+    fi
+
+    if ! start_point="$(resolve_backup_start_point)"
+    then
+        exit 1
+    fi
+
+    run "Creating backup branch '${BACKUP_BRANCH}' from '${start_point}'" \
+        git branch "${BACKUP_BRANCH}" "${start_point}"
+
+    if [ "${PUSH_BACKUP}" = "true" ] && [ "${LOCAL_ONLY}" = "false" ]
+    then
+        run "Pushing backup branch '${BACKUP_BRANCH}' to ${REMOTE_NAME}" \
+            git push "${REMOTE_NAME}" "${BACKUP_BRANCH}"
+    fi
+}
+
+delete_tags_if_needed()
+{
+    if [ "${KEEP_TAGS}" = "true" ]
+    then
+        TAGS_OUTCOME="kept"
+        echo
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL:+${STEP_LABEL} }${COLOR_YELLOW}--keep-tags specified. Skipping tag deletion.${COLOR_RESET}"
+        return 0
+    fi
+
+    mapfile -t tags < <(git tag -l)
+
+    if [ "${#tags[@]}" -eq 0 ]
+    then
+        TAGS_OUTCOME="none"
+        echo
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL:+${STEP_LABEL} }${COLOR_YELLOW}No tags found. Skipping tag deletion.${COLOR_RESET}"
+        return 0
+    fi
+
+    # apply protection
+    if [ "${#PROTECTED_TAGS[@]}" -gt 0 ]
+    then
+        filtered=()
+        for t in "${tags[@]}"
+        do
+            skip="false"
+            for pt in "${PROTECTED_TAGS[@]}"
+            do
+                if [ "${t}" = "${pt}" ]
+                then
+                    skip="true"
+                    break
+                fi
+            done
+            if [ "${skip}" = "false" ]
+            then
+                filtered+=( "${t}" )
+            fi
+        done
+        tags=( "${filtered[@]}" )
+    fi
+
+    if [ "${#tags[@]}" -eq 0 ]
+    then
+        TAGS_OUTCOME="none"
+        echo
+        echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL:+${STEP_LABEL} }${COLOR_YELLOW}After applying protected tags, no tags remain to delete.${COLOR_RESET}"
+        return 0
+    fi
+
+    echo
+    echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL:+${STEP_LABEL} }Deleting tags...${COLOR_RESET}"
+
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        echo "    git push ${REMOTE_NAME} --delete ${tags[*]}"
+        if [ "${DRY_RUN}" = "true" ]
+        then
+            echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+        elif ! git push "${REMOTE_NAME}" --delete "${tags[@]}"
+        then
+            TAGS_OUTCOME="failed"
+            echo "${COLOR_RED}ERROR:${COLOR_RESET} Tag cleanup failed after history rewrite succeeded." >&2
+            echo "       The branch was rewritten (and pushed if not --local-only), but tags were not fully deleted." >&2
+            return 1
+        fi
+    else
+        echo "==> ${COLOR_YELLOW}Local-only mode: skipping remote tag deletion.${COLOR_RESET}"
+    fi
+
+    echo "    git tag -d ${tags[*]}"
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+    elif ! git tag -d "${tags[@]}"
+    then
+        TAGS_OUTCOME="failed"
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} Local tag cleanup failed after history rewrite succeeded." >&2
+        return 1
+    fi
+
+    TAGS_DELETED_COUNT="${#tags[@]}"
+    TAGS_OUTCOME="deleted"
+    return 0
+}
+
+maybe_fetch()
+{
+    if [ "${NO_FETCH}" = "true" ] || [ "${LOCAL_ONLY}" = "true" ]
+    then
+        echo
+        echo "==> ${COLOR_YELLOW}Skipping 'git fetch' (no-fetch or local-only mode).${COLOR_RESET}"
+        return
+    fi
+
+    begin_step
+    run "Fetching latest from ${REMOTE_NAME}" \
+        git fetch "${REMOTE_NAME}"
+    STEP_LABEL=""
+}
+
+rewrite_history()
+{
+    STEP_CURRENT=0
+    count_planned_steps
+
+    maybe_fetch
+
+    if [ -n "${BACKUP_BRANCH}" ]
+    then
+        begin_step
+        create_backup_if_requested
+        STEP_LABEL=""
+    fi
+
+    begin_step
+    TEMP_BRANCH="temp-reset-$$"
+    if branch_exists "${TEMP_BRANCH}"
+    then
+        run "Removing pre-existing temporary branch '${TEMP_BRANCH}'" \
+            git branch -D "${TEMP_BRANCH}"
+    fi
+
+    run "Creating orphan branch '${TEMP_BRANCH}'" \
+        git checkout --orphan "${TEMP_BRANCH}"
+
+    run "Adding all files to the new history (tracked + untracked)" \
+        git add -A
+
+    if [ "${DRY_RUN}" != "true" ]
+    then
+        if git diff --cached --quiet
+        then
+            echo "${COLOR_RED}ERROR:${COLOR_RESET} Nothing to commit after staging; the working tree is empty." >&2
+            echo "       Refusing to create an empty initial commit." >&2
+            echo "       Restore an existing branch, then delete temporary branch '${TEMP_BRANCH}'." >&2
+            exit 1
+        fi
+    fi
+
+    run "Creating new initial commit" \
+        git commit -m "${COMMIT_MESSAGE}"
+
+    if [ "${KEEP_BRANCH}" = "false" ] && branch_exists "${TARGET_BRANCH}"
+    then
+        run "Deleting old branch '${TARGET_BRANCH}'" \
+            git branch -D "${TARGET_BRANCH}"
+    elif [ "${KEEP_BRANCH}" = "false" ]
+    then
+        echo
+        echo "==> ${COLOR_YELLOW}Branch '${TARGET_BRANCH}' does not exist locally. Skipping delete.${COLOR_RESET}"
+    fi
+
+    run "Renaming '${TEMP_BRANCH}' to '${TARGET_BRANCH}'" \
+        git branch -m "${TARGET_BRANCH}"
+    STEP_LABEL=""
+
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        begin_step
+        run "Force-pushing new '${TARGET_BRANCH}' to ${REMOTE_NAME} and setting upstream" \
+            git push -f --set-upstream "${REMOTE_NAME}" "${TARGET_BRANCH}"
+        STEP_LABEL=""
+    else
+        echo
+        echo "==> ${COLOR_YELLOW}Local-only mode: not pushing '${TARGET_BRANCH}' to any remote.${COLOR_RESET}"
+    fi
+
+    if [ "${KEEP_TAGS}" = "false" ]
+    then
+        begin_step
+        if ! delete_tags_if_needed
+        then
+            STEP_LABEL=""
+            print_summary_partial_tag_failure
+            exit 1
+        fi
+        STEP_LABEL=""
+    else
+        delete_tags_if_needed
+    fi
+
+    if [ "${NO_GC}" = "true" ]
+    then
+        echo
+        echo "==> ${COLOR_YELLOW}Skipping git gc (--no-gc requested).${COLOR_RESET}"
+    else
+        begin_step
+        run "Running aggressive garbage collection" \
+            git gc --aggressive --prune=all
+        STEP_LABEL=""
+    fi
+}
+
+print_summary_partial_tag_failure()
+{
+    echo
+    echo "${COLOR_RED}History rewrite succeeded, but tag cleanup failed.${COLOR_RESET}"
+    new_sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    echo "Branch:             ${TARGET_BRANCH}"
+    if [ -n "${new_sha}" ]
+    then
+        echo "New commit:         ${new_sha}"
+    fi
+    if [ -n "${BACKUP_BRANCH}" ]
+    then
+        echo "Backup branch:      ${BACKUP_BRANCH}"
+    fi
+    echo "Tags:               cleanup failed"
+}
+
+print_summary()
+{
+    echo
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}Dry-run complete. No changes were made.${COLOR_RESET}"
+        return
+    fi
+
+    echo "${COLOR_GREEN}All done.${COLOR_RESET}"
+    new_sha="$(git rev-parse --short HEAD 2>/dev/null || true)"
+    echo "Branch:             ${TARGET_BRANCH}"
+    if [ -n "${new_sha}" ]
+    then
+        echo "New commit:         ${new_sha}"
+    fi
+    if [ -n "${BACKUP_BRANCH}" ]
+    then
+        echo "Backup branch:      ${BACKUP_BRANCH}"
+    fi
+    case "${TAGS_OUTCOME}" in
+        kept) echo "Tags:               kept (--keep-tags)" ;;
+        none) echo "Tags:               none deleted" ;;
+        deleted) echo "Tags:               deleted ${TAGS_DELETED_COUNT}" ;;
+        failed) echo "Tags:               cleanup failed" ;;
+    esac
+    if [ "${KEEP_BRANCH}" = "true" ]
+    then
+        echo "Original primary '${PRIMARY_BRANCH}' was preserved."
+    fi
+    if [ "${LOCAL_ONLY}" = "true" ]
+    then
+        echo "Remotes were not touched (--local-only)."
+    else
+        echo "Force-push completed. Collaborators may need to re-clone or hard-reset."
+    fi
+}
+
+main()
+{
+    init_colors
+    parse_args "$@"
+    sanity_checks
+    detect_primary_branch
+    validate_combinations
+
+    print_action_plan
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        exit 0
+    fi
+
+    confirm
+    rewrite_history
+    print_summary
+}
+
+main "$@"
