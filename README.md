@@ -4,17 +4,17 @@
     </a>
 </p>
 
-<h1 align="center">git-reset-history</h1>
+<h1 align="center">Git Reset History</h1>
 
 Rewrite a Git repository down to a single initial commit — with dry-run, backups, and controlled tag handling.
 
-## What it does
+## What it Does
 
 `git-reset-history` replaces the primary branch history with one fresh commit that keeps the current tree. By default it then force-pushes the rewritten branch, deletes tags (local and remote), and runs an aggressive `git gc`.
 
 Use it when you want a clean slate without changing working-tree contents — for example after scaffolding, before a first public release, or when history is no longer useful.
 
-## Quick start
+## Quick Start
 
 ```bash
 ./src/git-reset-history --summary          # plan only — no changes
@@ -25,7 +25,7 @@ Use it when you want a clean slate without changing working-tree contents — fo
 
 **This is destructive.** Prefer `--summary` or `-n` first. Force-push is part of the default path unless you pass `--local-only`.
 
-## Default behaviour
+## Default Behaviour
 
 With no flags, the script will:
 
@@ -35,7 +35,7 @@ With no flags, the script will:
 4. Delete **all** tags locally and on the remote (after rewrite/push succeeds)
 5. Run `git gc --aggressive --prune=all`
 
-## Common options
+## Common Options
 
 | Flag                       | Purpose                                                      |
 | :------------------------- | :----------------------------------------------------------- |
@@ -90,7 +90,7 @@ Reset `main`, protect release tags, and push a remote backup:
   --yes
 ```
 
-## Safety notes
+## Safety Notes
 
 - `--dry-run` prints the action plan and simulates commands without asking for `RESET`.
 - Real runs require typing `RESET` unless you pass `-y` / `--yes`.
