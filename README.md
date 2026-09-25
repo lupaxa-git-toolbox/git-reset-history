@@ -14,6 +14,18 @@ Rewrite a Git repository down to a single initial commit — with dry-run, backu
 
 Use it when you want a clean slate without changing working-tree contents — for example after scaffolding, before a first public release, or when history is no longer useful.
 
+## Install
+
+With Homebrew:
+
+```bash
+brew tap the-lupaxa-project/tap
+brew trust the-lupaxa-project/tap
+brew install git-reset-history
+```
+
+Or run the script from a clone: `./src/git-reset-history --help`.
+
 ## Quick Start
 
 ```bash
